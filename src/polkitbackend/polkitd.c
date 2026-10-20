@@ -33,6 +33,12 @@
 
 #ifdef HAVE_LIBSYSTEMD
 #  include <systemd/sd-daemon.h>
+#else
+#  include <stddef.h>
+#  include <string.h>
+#  include <unistd.h>
+#  include <sys/socket.h>
+#  include <sys/un.h>
 #endif
 
 /* ---------------------------------------------------------------------------------------------------- */
@@ -51,6 +57,43 @@ static GOptionEntry            opt_entries[] = {
           "[emerg|alert|crit|err|warning|notice|info|debug]"},
   {NULL }
 };
+
+static void
+notify_service_manager (const gchar *state)
+{
+#ifdef HAVE_LIBSYSTEMD
+  sd_notify (0, state);
+#else
+  const gchar *path;
+  gsize path_len;
+  struct sockaddr_un addr;
+  gint fd;
+
+  path = g_getenv ("NOTIFY_SOCKET");
+  if (path == NULL || (path[0] != '/' && path[0] != '@'))
+    return;
+
+  path_len = strlen (path);
+  if (path_len >= sizeof (addr.sun_path))
+    return;
+
+  memset (&addr, 0, sizeof (addr));
+  addr.sun_family = AF_UNIX;
+  memcpy (addr.sun_path, path, path_len);
+
+  /* A leading '@' means a Linux abstract socket */
+  if (addr.sun_path[0] == '@')
+    addr.sun_path[0] = '\0';
+
+  fd = socket (AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    return;
+
+  sendto (fd, state, strlen (state), 0, (struct sockaddr *) &addr,
+          offsetof (struct sockaddr_un, sun_path) + path_len);
+  close (fd);
+#endif
+}
 
 static gboolean
 load_key_from_config_file (const gchar *filename,
@@ -192,9 +235,7 @@ on_name_acquired (GDBusConnection *connection,
                                 LOG_LEVEL_INFO,
                                 "Acquired the name org.freedesktop.PolicyKit1 on the system bus");
 
-#ifdef HAVE_LIBSYSTEMD
-  sd_notify (0, "READY=1\nSTATUS=Processing requests...");
-#endif
+  notify_service_manager ("READY=1\nSTATUS=Processing requests...");
 }
 
 static gboolean
@@ -218,8 +259,6 @@ static gboolean
 on_sighup (gpointer user_data)
 {
   guint expiration_seconds;
-
-#ifdef HAVE_LIBSYSTEMD
   gchar reload_message[sizeof("RELOADING=1\nMONOTONIC_USEC=18446744073709551615")];
   gint64 monotonic_now;
 
@@ -229,8 +268,7 @@ on_sighup (gpointer user_data)
   monotonic_now = g_get_monotonic_time ();
   g_snprintf (reload_message, sizeof(reload_message), "RELOADING=1\nMONOTONIC_USEC=%" G_GINT64_FORMAT, monotonic_now);
 
-  sd_notify (0, reload_message);
-#endif
+  notify_service_manager (reload_message);
 
   g_print ("Handling SIGHUP\n");
 
@@ -240,10 +278,8 @@ on_sighup (gpointer user_data)
     polkit_backend_interactive_authority_set_expiration_seconds (POLKIT_BACKEND_INTERACTIVE_AUTHORITY (authority),
                                                                  expiration_seconds);
 
-#ifdef HAVE_LIBSYSTEMD
   /* Notify systemd that we have finished reloading. */
-  sd_notify (0, "READY=1\nSTATUS=Processing requests...");
-#endif
+  notify_service_manager ("READY=1\nSTATUS=Processing requests...");
 
   return TRUE;
 }
@@ -434,9 +470,7 @@ main (int    argc,
 
   g_main_loop_run (loop);
 
-#ifdef HAVE_LIBSYSTEMD
-  sd_notify (0, "STOPPING=1");
-#endif
+  notify_service_manager ("STOPPING=1");
 
   g_print ("Shutting down\n");
  out:
